@@ -1,6 +1,6 @@
 """
-TerraAlert — FastAPI ML Backend v2.0
-Real trained models: Random Forest (wildfire, flood) + TFT (earthquake)
+TerraAlert — FastAPI ML Backend v3.0
+Real trained models + Live Weather API integration
 """
 
 from fastapi import FastAPI, HTTPException
@@ -17,8 +17,8 @@ import os
 
 app = FastAPI(
     title="TerraAlert ML API",
-    description="Multi-hazard disaster risk prediction — real trained models",
-    version="2.0.0"
+    description="Multi-hazard disaster risk prediction with live weather integration",
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -29,7 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── TFT Model Architecture (must match training) ─────────────────
+# ── TFT Model Architecture ────────────────────────────────────────
 class TFTModel(nn.Module):
     def __init__(self, input_size=4, d_model=64, n_heads=4, seq_len=10):
         super(TFTModel, self).__init__()
@@ -87,6 +87,32 @@ except Exception as e:
 
 print(f'Models ready: {list(models.keys())}')
 
+# ── Weather API ───────────────────────────────────────────────────
+WEATHER_API_KEY = "19abbda36913cb841139ba64fc611cb2"
+
+def get_weather_features(lat: float, lon: float) -> dict:
+    """Fetch live weather from OpenWeatherMap"""
+    url = f"http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units=metric"
+    try:
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        return {
+            "temperature": data["main"]["temp"],
+            "humidity": data["main"]["humidity"],
+            "wind_speed": data["wind"]["speed"],
+            "weather_main": data["weather"][0]["main"],
+            "weather_desc": data["weather"][0]["description"]
+        }
+    except Exception as e:
+        print(f"Weather API failed: {e}")
+        return {
+            "temperature": 25.0,
+            "humidity": 40.0,
+            "wind_speed": 10.0,
+            "weather_main": "Unknown",
+            "weather_desc": "Weather data unavailable"
+        }
+
 # ── Schemas ───────────────────────────────────────────────────────
 class WildfireRequest(BaseModel):
     latitude: float
@@ -94,6 +120,7 @@ class WildfireRequest(BaseModel):
     fire_year: int = 2024
     cause_code: int = 9
     discovery_doy: int = 180
+    fetch_live_weather: bool = True
 
 class FloodRequest(BaseModel):
     latitude: float
@@ -116,6 +143,7 @@ class RiskResponse(BaseModel):
     top_factors: List[str]
     timestamp: str
     location: dict
+    weather: Optional[dict] = None
 
 # ── Helpers ───────────────────────────────────────────────────────
 def classify_risk(score: float) -> str:
@@ -129,13 +157,15 @@ def classify_risk(score: float) -> str:
 def root():
     return {
         "name": "TerraAlert ML API",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "status": "running",
         "models_loaded": list(models.keys()),
+        "features": ["live_weather", "shap_explainability", "multi_hazard"],
         "endpoints": [
             "/predict/wildfire",
             "/predict/flood",
             "/predict/earthquake",
+            "/explain/wildfire",
             "/live/earthquakes"
         ]
     }
@@ -145,6 +175,7 @@ def health():
     return {
         "status": "healthy",
         "models_loaded": list(models.keys()),
+        "weather_api": "active",
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -152,6 +183,14 @@ def health():
 def predict_wildfire(req: WildfireRequest):
     if 'wildfire' not in models:
         raise HTTPException(status_code=503, detail="Wildfire model not loaded")
+
+    # Fetch live weather
+    weather = {}
+    if req.fetch_live_weather:
+        weather = get_weather_features(req.latitude, req.longitude)
+        print(f"Weather at ({req.latitude:.2f}, {req.longitude:.2f}): "
+              f"{weather['temperature']:.1f}C, {weather['humidity']}% humidity, "
+              f"{weather['wind_speed']:.1f} m/s wind")
 
     features = np.array([[
         req.latitude,
@@ -168,22 +207,64 @@ def predict_wildfire(req: WildfireRequest):
         'A': 0.05, 'B': 0.15, 'C': 0.30,
         'D': 0.45, 'E': 0.60, 'F': 0.80, 'G': 0.95
     }
-    risk_score = risk_map.get(predicted_class, 0.5)
+
+    class_labels = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
+    predicted_label = class_labels[int(predicted_class)] if str(predicted_class).isdigit() else predicted_class
+    risk_score = risk_map.get(predicted_label, 0.5)
+
+    # Boost risk based on live weather
+    weather_boost = 0.0
+    weather_factors = []
+
+    if weather:
+        temp = weather.get("temperature", 25)
+        humidity = weather.get("humidity", 40)
+        wind = weather.get("wind_speed", 10)
+
+        if temp > 35:
+            weather_boost += 0.10
+            weather_factors.append(f"High temperature: {temp:.1f}C")
+        elif temp > 28:
+            weather_boost += 0.05
+            weather_factors.append(f"Warm temperature: {temp:.1f}C")
+
+        if humidity < 15:
+            weather_boost += 0.15
+            weather_factors.append(f"Very low humidity: {humidity}%")
+        elif humidity < 25:
+            weather_boost += 0.08
+            weather_factors.append(f"Low humidity: {humidity}%")
+
+        if wind > 15:
+            weather_boost += 0.10
+            weather_factors.append(f"Strong wind: {wind:.1f} m/s")
+        elif wind > 8:
+            weather_boost += 0.05
+            weather_factors.append(f"Moderate wind: {wind:.1f} m/s")
+
+    risk_score = min(risk_score + weather_boost, 1.0)
+
+    factors = [
+        f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
+        f"Predicted fire size class: {predicted_label}",
+        f"Day of year: {req.discovery_doy}",
+        f"Cause code: {req.cause_code}",
+    ]
+    if weather_factors:
+        factors.extend(weather_factors)
+    elif weather:
+        factors.append(f"Current conditions: {weather.get('weather_desc', 'N/A')}")
 
     return RiskResponse(
         disaster_type="wildfire",
         risk_level=classify_risk(risk_score),
         risk_score=round(risk_score, 3),
         confidence=round(float(max(proba)), 3),
-        model_used="Random Forest — trained on 1.88M US wildfires (Kaggle)",
-        top_factors=[
-            f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
-            f"Predicted fire size class: {predicted_class}",
-            f"Day of year: {req.discovery_doy}",
-            f"Cause code: {req.cause_code}"
-        ],
+        model_used="Random Forest + Live Weather (OpenWeatherMap)",
+        top_factors=factors,
         timestamp=datetime.utcnow().isoformat(),
-        location={"lat": req.latitude, "lon": req.longitude}
+        location={"lat": req.latitude, "lon": req.longitude},
+        weather=weather if weather else None
     )
 
 @app.post("/predict/flood", response_model=RiskResponse)
@@ -247,6 +328,43 @@ def predict_earthquake(req: EarthquakeRequest):
         location={"lat": req.latitude, "lon": req.longitude}
     )
 
+@app.post("/explain/wildfire")
+def explain_wildfire(req: WildfireRequest):
+    if 'wildfire' not in models:
+        raise HTTPException(status_code=503, detail="Wildfire model not loaded")
+
+    import shap
+    features = np.array([[
+        req.latitude,
+        req.longitude,
+        req.fire_year,
+        req.cause_code,
+        req.discovery_doy
+    ]])
+
+    feature_names = ['Latitude', 'Longitude', 'Fire Year',
+                     'Cause Code', 'Day of Year']
+
+    explainer = shap.TreeExplainer(models['wildfire'])
+    shap_values = explainer.shap_values(features)
+
+    mean_shap = np.mean(np.abs(shap_values), axis=0)[0]
+
+    top_indices = np.argsort(mean_shap)[::-1][:3]
+    top_factors = [
+        {
+            "feature": feature_names[i],
+            "importance": round(float(mean_shap[i]), 4),
+            "value": round(float(features[0][i]), 4)
+        }
+        for i in top_indices
+    ]
+
+    return {
+        "top_factors": top_factors,
+        "explanation": f"Top predictor: {feature_names[top_indices[0]]}"
+    }
+
 @app.get("/live/earthquakes")
 def live_earthquakes(min_magnitude: float = 4.0, hours: int = 48):
     end_time = datetime.utcnow()
@@ -308,44 +426,15 @@ def live_wildfires():
         "source": "NASA FIRMS",
         "status": "active",
         "api_key": "configured",
-        "model": "Random Forest — trained on 1.88M historical wildfires"
+        "model": "Random Forest + Live Weather — trained on 1.88M historical wildfires"
     }
 
-@app.post("/explain/wildfire")
-def explain_wildfire(req: WildfireRequest):
-    if 'wildfire' not in models:
-        raise HTTPException(status_code=503, detail="Wildfire model not loaded")
-    
-    import shap
-    features = np.array([[
-        req.latitude,
-        req.longitude,
-        req.fire_year,
-        req.cause_code,
-        req.discovery_doy
-    ]])
-    
-    feature_names = ['Latitude', 'Longitude', 'Fire Year', 
-                     'Cause Code', 'Day of Year']
-    
-    explainer = shap.TreeExplainer(models['wildfire'])
-    shap_values = explainer.shap_values(features)
-    
-    # Get mean absolute shap values across classes
-    mean_shap = np.mean(np.abs(shap_values), axis=0)[0]
-    
-    # Top 3 factors
-    top_indices = np.argsort(mean_shap)[::-1][:3]
-    top_factors = [
-        {
-            "feature": feature_names[i],
-            "importance": round(float(mean_shap[i]), 4),
-            "value": round(float(features[0][i]), 4)
-        }
-        for i in top_indices
-    ]
-    
+@app.get("/weather/{lat}/{lon}")
+def get_weather(lat: float, lon: float):
+    """Get live weather for any location"""
+    weather = get_weather_features(lat, lon)
     return {
-        "top_factors": top_factors,
-        "explanation": f"Location ({req.latitude:.2f}, {req.longitude:.2f}) is the primary driver"
+        "location": {"lat": lat, "lon": lon},
+        "weather": weather,
+        "timestamp": datetime.utcnow().isoformat()
     }
