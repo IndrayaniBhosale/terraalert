@@ -1,6 +1,6 @@
 """
-TerraAlert — FastAPI ML Backend v3.0
-Real trained models + Live Weather API integration
+TerraAlert — FastAPI ML Backend v4.0
+Real trained models + Live Weather + Incident Reporting + Prediction History
 """
 
 from fastapi import FastAPI, HTTPException
@@ -18,7 +18,7 @@ import os
 app = FastAPI(
     title="TerraAlert ML API",
     description="Multi-hazard disaster risk prediction with live weather integration",
-    version="3.0.0"
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -87,11 +87,14 @@ except Exception as e:
 
 print(f'Models ready: {list(models.keys())}')
 
+# ── In-memory stores ──────────────────────────────────────────────
+incident_reports = []
+prediction_history = []
+
 # ── Weather API ───────────────────────────────────────────────────
 WEATHER_API_KEY = "19abbda36913cb841139ba64fc611cb2"
 
 def get_weather_features(lat: float, lon: float) -> dict:
-    """Fetch live weather from OpenWeatherMap"""
     url = f"http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units=metric"
     try:
         response = requests.get(url, timeout=5)
@@ -113,6 +116,19 @@ def get_weather_features(lat: float, lon: float) -> dict:
             "weather_desc": "Weather data unavailable"
         }
 
+def log_prediction(disaster_type: str, risk_level: str,
+                   confidence: float, location: dict):
+    prediction_history.append({
+        "id": f"pred_{len(prediction_history)}",
+        "disaster_type": disaster_type,
+        "risk_level": risk_level,
+        "confidence": confidence,
+        "location": location,
+        "timestamp": datetime.utcnow().isoformat()
+    })
+    if len(prediction_history) > 50:
+        prediction_history.pop(0)
+
 # ── Schemas ───────────────────────────────────────────────────────
 class WildfireRequest(BaseModel):
     latitude: float
@@ -133,6 +149,14 @@ class EarthquakeRequest(BaseModel):
     longitude: float
     depth_km: float
     recent_mag_mean: Optional[float] = 5.0
+
+class IncidentReport(BaseModel):
+    latitude: float
+    longitude: float
+    disaster_type: str
+    severity: str
+    description: str
+    reporter_name: Optional[str] = "Anonymous"
 
 class RiskResponse(BaseModel):
     disaster_type: str
@@ -157,16 +181,26 @@ def classify_risk(score: float) -> str:
 def root():
     return {
         "name": "TerraAlert ML API",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "status": "running",
         "models_loaded": list(models.keys()),
-        "features": ["live_weather", "shap_explainability", "multi_hazard"],
+        "features": [
+            "live_weather",
+            "shap_explainability",
+            "incident_reporting",
+            "prediction_history",
+            "multi_hazard"
+        ],
         "endpoints": [
             "/predict/wildfire",
             "/predict/flood",
             "/predict/earthquake",
             "/explain/wildfire",
-            "/live/earthquakes"
+            "/live/earthquakes",
+            "/report/incident",
+            "/report/incidents",
+            "/history/predictions",
+            "/weather/{lat}/{lon}"
         ]
     }
 
@@ -176,6 +210,8 @@ def health():
         "status": "healthy",
         "models_loaded": list(models.keys()),
         "weather_api": "active",
+        "total_predictions": len(prediction_history),
+        "total_reports": len(incident_reports),
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -184,7 +220,6 @@ def predict_wildfire(req: WildfireRequest):
     if 'wildfire' not in models:
         raise HTTPException(status_code=503, detail="Wildfire model not loaded")
 
-    # Fetch live weather
     weather = {}
     if req.fetch_live_weather:
         weather = get_weather_features(req.latitude, req.longitude)
@@ -193,11 +228,8 @@ def predict_wildfire(req: WildfireRequest):
               f"{weather['wind_speed']:.1f} m/s wind")
 
     features = np.array([[
-        req.latitude,
-        req.longitude,
-        req.fire_year,
-        req.cause_code,
-        req.discovery_doy
+        req.latitude, req.longitude,
+        req.fire_year, req.cause_code, req.discovery_doy
     ]])
 
     proba = models['wildfire'].predict_proba(features)[0]
@@ -207,12 +239,10 @@ def predict_wildfire(req: WildfireRequest):
         'A': 0.05, 'B': 0.15, 'C': 0.30,
         'D': 0.45, 'E': 0.60, 'F': 0.80, 'G': 0.95
     }
-
     class_labels = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
     predicted_label = class_labels[int(predicted_class)] if str(predicted_class).isdigit() else predicted_class
     risk_score = risk_map.get(predicted_label, 0.5)
 
-    # Boost risk based on live weather
     weather_boost = 0.0
     weather_factors = []
 
@@ -227,14 +257,12 @@ def predict_wildfire(req: WildfireRequest):
         elif temp > 28:
             weather_boost += 0.05
             weather_factors.append(f"Warm temperature: {temp:.1f}C")
-
         if humidity < 15:
             weather_boost += 0.15
             weather_factors.append(f"Very low humidity: {humidity}%")
         elif humidity < 25:
             weather_boost += 0.08
             weather_factors.append(f"Low humidity: {humidity}%")
-
         if wind > 15:
             weather_boost += 0.10
             weather_factors.append(f"Strong wind: {wind:.1f} m/s")
@@ -255,6 +283,10 @@ def predict_wildfire(req: WildfireRequest):
     elif weather:
         factors.append(f"Current conditions: {weather.get('weather_desc', 'N/A')}")
 
+    log_prediction("wildfire", classify_risk(risk_score),
+                   round(float(max(proba)), 3),
+                   {"lat": req.latitude, "lon": req.longitude})
+
     return RiskResponse(
         disaster_type="wildfire",
         risk_level=classify_risk(risk_score),
@@ -273,10 +305,8 @@ def predict_flood(req: FloodRequest):
         raise HTTPException(status_code=503, detail="Flood model not loaded")
 
     features = np.array([[
-        req.latitude,
-        req.longitude,
-        req.event_type_code,
-        req.state_code
+        req.latitude, req.longitude,
+        req.event_type_code, req.state_code
     ]])
 
     proba = models['flood'].predict_proba(features)[0]
@@ -284,6 +314,10 @@ def predict_flood(req: FloodRequest):
     risk_score = predicted_severity / 2.0
 
     severity_labels = {0: 'Low', 1: 'Medium', 2: 'High'}
+
+    log_prediction("flood", classify_risk(risk_score),
+                   round(float(max(proba)), 3),
+                   {"lat": req.latitude, "lon": req.longitude})
 
     return RiskResponse(
         disaster_type="flood",
@@ -312,6 +346,9 @@ def predict_earthquake(req: EarthquakeRequest):
     if req.depth_km < 10:
         risk_score = min(risk_score + 0.1, 1.0)
 
+    log_prediction("earthquake", classify_risk(risk_score),
+                   0.79, {"lat": req.latitude, "lon": req.longitude})
+
     return RiskResponse(
         disaster_type="earthquake",
         risk_level=classify_risk(risk_score),
@@ -335,11 +372,8 @@ def explain_wildfire(req: WildfireRequest):
 
     import shap
     features = np.array([[
-        req.latitude,
-        req.longitude,
-        req.fire_year,
-        req.cause_code,
-        req.discovery_doy
+        req.latitude, req.longitude,
+        req.fire_year, req.cause_code, req.discovery_doy
     ]])
 
     feature_names = ['Latitude', 'Longitude', 'Fire Year',
@@ -347,7 +381,6 @@ def explain_wildfire(req: WildfireRequest):
 
     explainer = shap.TreeExplainer(models['wildfire'])
     shap_values = explainer.shap_values(features)
-
     mean_shap = np.mean(np.abs(shap_values), axis=0)[0]
 
     top_indices = np.argsort(mean_shap)[::-1][:3]
@@ -363,6 +396,41 @@ def explain_wildfire(req: WildfireRequest):
     return {
         "top_factors": top_factors,
         "explanation": f"Top predictor: {feature_names[top_indices[0]]}"
+    }
+
+@app.post("/report/incident")
+def submit_incident(report: IncidentReport):
+    incident = {
+        "id": f"report_{len(incident_reports)}",
+        "latitude": report.latitude,
+        "longitude": report.longitude,
+        "disaster_type": report.disaster_type,
+        "severity": report.severity,
+        "description": report.description,
+        "reporter": report.reporter_name,
+        "timestamp": datetime.utcnow().isoformat(),
+        "risk_level": report.severity.upper()
+    }
+    incident_reports.append(incident)
+    print(f"New report: {report.disaster_type} at ({report.latitude:.2f}, {report.longitude:.2f})")
+    return {
+        "status": "success",
+        "id": incident["id"],
+        "message": "Report submitted successfully"
+    }
+
+@app.get("/report/incidents")
+def get_incidents():
+    return {
+        "count": len(incident_reports),
+        "incidents": incident_reports
+    }
+
+@app.get("/history/predictions")
+def get_prediction_history():
+    return {
+        "count": len(prediction_history),
+        "predictions": list(reversed(prediction_history))
     }
 
 @app.get("/live/earthquakes")
@@ -425,13 +493,11 @@ def live_wildfires():
     return {
         "source": "NASA FIRMS",
         "status": "active",
-        "api_key": "configured",
-        "model": "Random Forest + Live Weather — trained on 1.88M historical wildfires"
+        "model": "Random Forest + Live Weather"
     }
 
 @app.get("/weather/{lat}/{lon}")
 def get_weather(lat: float, lon: float):
-    """Get live weather for any location"""
     weather = get_weather_features(lat, lon)
     return {
         "location": {"lat": lat, "lon": lon},
