@@ -1,6 +1,6 @@
 """
-TerraAlert — FastAPI ML Backend v4.0
-Real trained models + Live Weather + Incident Reporting + Prediction History
+TerraAlert — FastAPI ML Backend v5.0
+Real trained models + Live Weather + Email Alerts + Incident Reporting + Prediction History
 """
 
 from fastapi import FastAPI, HTTPException
@@ -12,13 +12,19 @@ import joblib
 import torch
 import torch.nn as nn
 import requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI(
     title="TerraAlert ML API",
-    description="Multi-hazard disaster risk prediction with live weather integration",
-    version="4.0.0"
+    description="Multi-hazard disaster risk prediction with live weather and email alerts",
+    version="5.0.0"
 )
 
 app.add_middleware(
@@ -91,8 +97,63 @@ print(f'Models ready: {list(models.keys())}')
 incident_reports = []
 prediction_history = []
 
-# ── Weather API ───────────────────────────────────────────────────
-WEATHER_API_KEY = "19abbda36913cb841139ba64fc611cb2"
+# ── Config from .env ─────────────────────────────────────────────
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "")
+EMAIL_SENDER    = os.getenv("EMAIL_SENDER", "")
+EMAIL_PASSWORD  = os.getenv("EMAIL_PASSWORD", "")
+EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT", "")
+
+# ── Resource inventory ────────────────────────────────────────────
+RESOURCES = [
+    {"id": "R1", "type": "Fire Engine",    "lat": 34.05, "lon": -118.24, "city": "Los Angeles",   "available": True},
+    {"id": "R2", "type": "Rescue Team",    "lat": 37.77, "lon": -122.41, "city": "San Francisco",  "available": True},
+    {"id": "R3", "type": "Ambulance",      "lat": 47.60, "lon": -122.33, "city": "Seattle",        "available": True},
+    {"id": "R4", "type": "Fire Engine",    "lat": 33.44, "lon": -112.07, "city": "Phoenix",        "available": True},
+    {"id": "R5", "type": "Flood Response", "lat": 29.76, "lon": -95.36,  "city": "Houston",        "available": True},
+    {"id": "R6", "type": "Rescue Team",    "lat": 41.85, "lon": -87.65,  "city": "Chicago",        "available": True},
+    {"id": "R7", "type": "Ambulance",      "lat": 40.71, "lon": -74.00,  "city": "New York",       "available": True},
+    {"id": "R8", "type": "Flood Response", "lat": 25.77, "lon": -80.19,  "city": "Miami",          "available": True},
+]
+
+# ── Helper functions ──────────────────────────────────────────────
+def classify_risk(score: float) -> str:
+    if score < 0.25: return "LOW"
+    elif score < 0.5: return "MEDIUM"
+    elif score < 0.75: return "HIGH"
+    else: return "CRITICAL"
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance in km between two coordinates"""
+    from math import radians, sin, cos, sqrt, atan2
+    R = 6371
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    return R * 2 * atan2(sqrt(a), sqrt(1-a))
+
+def allocate_resources(lat: float, lon: float, disaster_type: str, count: int = 2):
+    """Find nearest available resources for a disaster location"""
+    available = [r for r in RESOURCES if r["available"]]
+    if not available:
+        return []
+
+    # Score resources by distance and type match
+    scored = []
+    type_preference = {
+        "wildfire": "Fire Engine",
+        "flood": "Flood Response",
+        "earthquake": "Rescue Team"
+    }
+    preferred_type = type_preference.get(disaster_type, "Rescue Team")
+
+    for r in available:
+        dist = haversine_distance(lat, lon, r["lat"], r["lon"])
+        type_bonus = -50 if r["type"] == preferred_type else 0
+        scored.append({**r, "distance_km": round(dist, 1), "score": dist + type_bonus})
+
+    scored.sort(key=lambda x: x["score"])
+    return scored[:count]
 
 def get_weather_features(lat: float, lon: float) -> dict:
     url = f"http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units=metric"
@@ -128,6 +189,96 @@ def log_prediction(disaster_type: str, risk_level: str,
     })
     if len(prediction_history) > 50:
         prediction_history.pop(0)
+
+def send_critical_alert(disaster_type: str, risk_level: str,
+                        location: dict, factors: list,
+                        weather: dict = None, resources: list = None):
+    if risk_level != "CRITICAL":
+        return
+    if not EMAIL_SENDER or not EMAIL_PASSWORD:
+        print("Email not configured — skipping alert")
+        return
+
+    try:
+        subject = f"CRITICAL Alert — {disaster_type.upper()} detected by TerraAlert"
+
+        factors_html = "".join(f"<li>{f}</li>" for f in factors)
+
+        weather_html = ""
+        if weather:
+            weather_html = f"""
+            <h3 style="color:#58a6ff;">Current Weather</h3>
+            <ul>
+                <li>Temperature: {weather.get('temperature', 'N/A')}C</li>
+                <li>Humidity: {weather.get('humidity', 'N/A')}%</li>
+                <li>Wind Speed: {weather.get('wind_speed', 'N/A')} m/s</li>
+                <li>Conditions: {weather.get('weather_desc', 'N/A')}</li>
+            </ul>
+            """
+
+        resources_html = ""
+        if resources:
+            res_rows = "".join(
+                f"<tr><td>{r['id']}</td><td>{r['type']}</td><td>{r['city']}</td><td>{r['distance_km']} km</td></tr>"
+                for r in resources
+            )
+            resources_html = f"""
+            <h3 style="color:#58a6ff;">Allocated Resources</h3>
+            <table border="1" cellpadding="6" style="border-collapse:collapse;color:#e6edf3;">
+                <tr style="background:#21262d;"><th>ID</th><th>Type</th><th>Location</th><th>Distance</th></tr>
+                {res_rows}
+            </table>
+            """
+
+        body = f"""
+        <html>
+        <body style="font-family:Arial,sans-serif;background:#0d1117;color:#e6edf3;padding:20px;">
+            <div style="max-width:600px;margin:0 auto;background:#161b22;border-radius:12px;padding:24px;border:2px solid #e74c3c;">
+                <h1 style="color:#e74c3c;margin:0 0 8px;">
+                    CRITICAL ALERT — {disaster_type.upper()}
+                </h1>
+                <p style="color:#8b949e;margin:0 0 20px;">
+                    TerraAlert has detected a critical {disaster_type} risk event requiring immediate attention
+                </p>
+
+                <h3 style="color:#58a6ff;">Location</h3>
+                <p>Latitude: {location.get('lat', 'N/A')}<br>
+                   Longitude: {location.get('lon', 'N/A')}</p>
+
+                <h3 style="color:#58a6ff;">Risk Assessment</h3>
+                <p style="color:#e74c3c;font-size:28px;font-weight:bold;margin:0;">CRITICAL</p>
+
+                <h3 style="color:#58a6ff;">Contributing Factors</h3>
+                <ul>{factors_html}</ul>
+
+                {weather_html}
+                {resources_html}
+
+                <hr style="border-color:#30363d;margin:20px 0;">
+                <p style="color:#8b949e;font-size:12px;">
+                    Sent by TerraAlert — AI-Powered Multi-Hazard Disaster Intelligence Platform<br>
+                    Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
+                    Model: Random Forest (wildfire/flood) | TFT (earthquake)
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = EMAIL_SENDER
+        msg['To'] = EMAIL_RECIPIENT
+        msg.attach(MIMEText(body, 'html'))
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
+
+        print(f"CRITICAL alert email sent for {disaster_type} at {location}")
+
+    except Exception as e:
+        print(f"Email failed: {e}")
 
 # ── Schemas ───────────────────────────────────────────────────────
 class WildfireRequest(BaseModel):
@@ -168,25 +319,21 @@ class RiskResponse(BaseModel):
     timestamp: str
     location: dict
     weather: Optional[dict] = None
-
-# ── Helpers ───────────────────────────────────────────────────────
-def classify_risk(score: float) -> str:
-    if score < 0.25: return "LOW"
-    elif score < 0.5: return "MEDIUM"
-    elif score < 0.75: return "HIGH"
-    else: return "CRITICAL"
+    allocated_resources: Optional[list] = None
 
 # ── Endpoints ─────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
         "name": "TerraAlert ML API",
-        "version": "4.0.0",
+        "version": "5.0.0",
         "status": "running",
         "models_loaded": list(models.keys()),
         "features": [
             "live_weather",
             "shap_explainability",
+            "email_alerts",
+            "resource_allocation",
             "incident_reporting",
             "prediction_history",
             "multi_hazard"
@@ -197,6 +344,7 @@ def root():
             "/predict/earthquake",
             "/explain/wildfire",
             "/live/earthquakes",
+            "/resources",
             "/report/incident",
             "/report/incidents",
             "/history/predictions",
@@ -209,10 +357,20 @@ def health():
     return {
         "status": "healthy",
         "models_loaded": list(models.keys()),
-        "weather_api": "active",
+        "weather_api": "active" if WEATHER_API_KEY else "not configured",
+        "email_alerts": "active" if EMAIL_SENDER else "not configured",
         "total_predictions": len(prediction_history),
         "total_reports": len(incident_reports),
         "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/resources")
+def get_resources():
+    """Get all available emergency resources"""
+    return {
+        "total": len(RESOURCES),
+        "available": len([r for r in RESOURCES if r["available"]]),
+        "resources": RESOURCES
     }
 
 @app.post("/predict/wildfire", response_model=RiskResponse)
@@ -245,12 +403,10 @@ def predict_wildfire(req: WildfireRequest):
 
     weather_boost = 0.0
     weather_factors = []
-
     if weather:
         temp = weather.get("temperature", 25)
         humidity = weather.get("humidity", 40)
         wind = weather.get("wind_speed", 10)
-
         if temp > 35:
             weather_boost += 0.10
             weather_factors.append(f"High temperature: {temp:.1f}C")
@@ -271,6 +427,7 @@ def predict_wildfire(req: WildfireRequest):
             weather_factors.append(f"Moderate wind: {wind:.1f} m/s")
 
     risk_score = min(risk_score + weather_boost, 1.0)
+    risk_level = classify_risk(risk_score)
 
     factors = [
         f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
@@ -283,20 +440,29 @@ def predict_wildfire(req: WildfireRequest):
     elif weather:
         factors.append(f"Current conditions: {weather.get('weather_desc', 'N/A')}")
 
-    log_prediction("wildfire", classify_risk(risk_score),
+    # Allocate resources if critical
+    allocated = []
+    if risk_level == "CRITICAL":
+        allocated = allocate_resources(req.latitude, req.longitude, "wildfire")
+        send_critical_alert("wildfire", risk_level,
+                           {"lat": req.latitude, "lon": req.longitude},
+                           factors, weather, allocated)
+
+    log_prediction("wildfire", risk_level,
                    round(float(max(proba)), 3),
                    {"lat": req.latitude, "lon": req.longitude})
 
     return RiskResponse(
         disaster_type="wildfire",
-        risk_level=classify_risk(risk_score),
+        risk_level=risk_level,
         risk_score=round(risk_score, 3),
         confidence=round(float(max(proba)), 3),
         model_used="Random Forest + Live Weather (OpenWeatherMap)",
         top_factors=factors,
         timestamp=datetime.utcnow().isoformat(),
         location={"lat": req.latitude, "lon": req.longitude},
-        weather=weather if weather else None
+        weather=weather if weather else None,
+        allocated_resources=allocated if allocated else None
     )
 
 @app.post("/predict/flood", response_model=RiskResponse)
@@ -312,27 +478,37 @@ def predict_flood(req: FloodRequest):
     proba = models['flood'].predict_proba(features)[0]
     predicted_severity = int(models['flood'].predict(features)[0])
     risk_score = predicted_severity / 2.0
+    risk_level = classify_risk(risk_score)
 
     severity_labels = {0: 'Low', 1: 'Medium', 2: 'High'}
+    factors = [
+        f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
+        f"Predicted severity: {severity_labels.get(predicted_severity, 'Unknown')}",
+        f"Flood type code: {req.event_type_code}",
+        f"State code: {req.state_code}"
+    ]
 
-    log_prediction("flood", classify_risk(risk_score),
+    allocated = []
+    if risk_level == "CRITICAL":
+        allocated = allocate_resources(req.latitude, req.longitude, "flood")
+        send_critical_alert("flood", risk_level,
+                           {"lat": req.latitude, "lon": req.longitude},
+                           factors, None, allocated)
+
+    log_prediction("flood", risk_level,
                    round(float(max(proba)), 3),
                    {"lat": req.latitude, "lon": req.longitude})
 
     return RiskResponse(
         disaster_type="flood",
-        risk_level=classify_risk(risk_score),
+        risk_level=risk_level,
         risk_score=round(risk_score, 3),
         confidence=round(float(max(proba)), 3),
         model_used="Random Forest — trained on 40K NOAA flood events",
-        top_factors=[
-            f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
-            f"Predicted severity: {severity_labels.get(predicted_severity, 'Unknown')}",
-            f"Flood type code: {req.event_type_code}",
-            f"State code: {req.state_code}"
-        ],
+        top_factors=factors,
         timestamp=datetime.utcnow().isoformat(),
-        location={"lat": req.latitude, "lon": req.longitude}
+        location={"lat": req.latitude, "lon": req.longitude},
+        allocated_resources=allocated if allocated else None
     )
 
 @app.post("/predict/earthquake", response_model=RiskResponse)
@@ -346,23 +522,34 @@ def predict_earthquake(req: EarthquakeRequest):
     if req.depth_km < 10:
         risk_score = min(risk_score + 0.1, 1.0)
 
-    log_prediction("earthquake", classify_risk(risk_score),
+    risk_level = classify_risk(risk_score)
+    factors = [
+        f"Magnitude: {mag}",
+        f"Depth: {req.depth_km}km",
+        f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
+        "TFT attention over last 10 seismic events"
+    ]
+
+    allocated = []
+    if risk_level == "CRITICAL":
+        allocated = allocate_resources(req.latitude, req.longitude, "earthquake")
+        send_critical_alert("earthquake", risk_level,
+                           {"lat": req.latitude, "lon": req.longitude},
+                           factors, None, allocated)
+
+    log_prediction("earthquake", risk_level,
                    0.79, {"lat": req.latitude, "lon": req.longitude})
 
     return RiskResponse(
         disaster_type="earthquake",
-        risk_level=classify_risk(risk_score),
+        risk_level=risk_level,
         risk_score=round(risk_score, 3),
         confidence=0.79,
         model_used="Temporal Fusion Transformer — RMSE 0.1179 on USGS data",
-        top_factors=[
-            f"Magnitude: {mag}",
-            f"Depth: {req.depth_km}km",
-            f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
-            "TFT attention over last 10 seismic events"
-        ],
+        top_factors=factors,
         timestamp=datetime.utcnow().isoformat(),
-        location={"lat": req.latitude, "lon": req.longitude}
+        location={"lat": req.latitude, "lon": req.longitude},
+        allocated_resources=allocated if allocated else None
     )
 
 @app.post("/explain/wildfire")
@@ -466,8 +653,7 @@ def live_earthquakes(min_magnitude: float = 4.0, hours: int = 48):
             events.append({
                 "magnitude": mag,
                 "place": props.get("place"),
-                "time": datetime.utcfromtimestamp(
-                    props["time"] / 1000).isoformat(),
+                "time": datetime.utcfromtimestamp(props["time"] / 1000).isoformat(),
                 "latitude": coords[1],
                 "longitude": coords[0],
                 "depth_km": coords[2],
@@ -483,10 +669,7 @@ def live_earthquakes(min_magnitude: float = 4.0, hours: int = 48):
             "events": events
         }
     except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"USGS API unavailable: {str(e)}"
-        )
+        raise HTTPException(status_code=503, detail=f"USGS API unavailable: {str(e)}")
 
 @app.get("/live/wildfires")
 def live_wildfires():
