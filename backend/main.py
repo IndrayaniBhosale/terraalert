@@ -310,3 +310,42 @@ def live_wildfires():
         "api_key": "configured",
         "model": "Random Forest — trained on 1.88M historical wildfires"
     }
+
+@app.post("/explain/wildfire")
+def explain_wildfire(req: WildfireRequest):
+    if 'wildfire' not in models:
+        raise HTTPException(status_code=503, detail="Wildfire model not loaded")
+    
+    import shap
+    features = np.array([[
+        req.latitude,
+        req.longitude,
+        req.fire_year,
+        req.cause_code,
+        req.discovery_doy
+    ]])
+    
+    feature_names = ['Latitude', 'Longitude', 'Fire Year', 
+                     'Cause Code', 'Day of Year']
+    
+    explainer = shap.TreeExplainer(models['wildfire'])
+    shap_values = explainer.shap_values(features)
+    
+    # Get mean absolute shap values across classes
+    mean_shap = np.mean(np.abs(shap_values), axis=0)[0]
+    
+    # Top 3 factors
+    top_indices = np.argsort(mean_shap)[::-1][:3]
+    top_factors = [
+        {
+            "feature": feature_names[i],
+            "importance": round(float(mean_shap[i]), 4),
+            "value": round(float(features[0][i]), 4)
+        }
+        for i in top_indices
+    ]
+    
+    return {
+        "top_factors": top_factors,
+        "explanation": f"Location ({req.latitude:.2f}, {req.longitude:.2f}) is the primary driver"
+    }
