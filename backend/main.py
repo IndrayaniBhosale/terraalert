@@ -1,7 +1,7 @@
 """
-TerraAlert — FastAPI ML Backend v6.0
+TerraAlert — FastAPI ML Backend v5.0
 Real trained models + Live Weather + Email Alerts + Incident Reporting + Prediction History
-Disasters: Wildfire, Flood, Earthquake, Tornado
+Pre-computed SHAP for instant wildfire explanations
 """
 
 from fastapi import FastAPI, HTTPException
@@ -25,7 +25,7 @@ load_dotenv()
 app = FastAPI(
     title="TerraAlert ML API",
     description="Multi-hazard disaster risk prediction with live weather and email alerts",
-    version="6.0.0"
+    version="5.0.0"
 )
 
 app.add_middleware(
@@ -92,12 +92,6 @@ try:
 except Exception as e:
     print(f'Earthquake model not found: {e}')
 
-try:
-    models['tornado'] = joblib.load(f'{MODELS_PATH}/rf_tornado.joblib')
-    print('Tornado model loaded')
-except Exception as e:
-    print(f'Tornado model not found: {e}')
-
 print(f'Models ready: {list(models.keys())}')
 
 # ── Pre-compute SHAP explainer at startup ─────────────────────────
@@ -109,6 +103,7 @@ try:
             models['wildfire'],
             feature_perturbation="tree_path_dependent"
         )
+        # Warm up with one sample so first click is instant
         _sample = np.array([[34.05, -118.24, 2024, 9, 105]])
         _ = shap_explainer.shap_values(_sample, check_additivity=False)
         print('SHAP explainer ready')
@@ -119,7 +114,7 @@ except Exception as e:
 incident_reports = []
 prediction_history = []
 
-# ── Config from .env ──────────────────────────────────────────────
+# ── Config from .env ─────────────────────────────────────────────
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "")
 EMAIL_SENDER    = os.getenv("EMAIL_SENDER", "")
 EMAIL_PASSWORD  = os.getenv("EMAIL_PASSWORD", "")
@@ -159,9 +154,8 @@ def allocate_resources(lat: float, lon: float, disaster_type: str, count: int = 
         return []
     type_preference = {
         "wildfire": "Fire Engine",
-        "flood":    "Flood Response",
-        "earthquake": "Rescue Team",
-        "tornado":  "Rescue Team",
+        "flood": "Flood Response",
+        "earthquake": "Rescue Team"
     }
     preferred_type = type_preference.get(disaster_type, "Rescue Team")
     scored = []
@@ -260,7 +254,7 @@ def send_critical_alert(disaster_type: str, risk_level: str,
                 <p style="color:#8b949e;font-size:12px;">
                     Sent by TerraAlert — AI-Powered Multi-Hazard Disaster Intelligence Platform<br>
                     Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
-                    Disasters: Wildfire | Flood | Earthquake | Tornado
+                    Model: Random Forest (wildfire/flood) | TFT (earthquake)
                 </p>
             </div>
         </body>
@@ -299,13 +293,6 @@ class EarthquakeRequest(BaseModel):
     depth_km: float
     recent_mag_mean: Optional[float] = 5.0
 
-class TornadoRequest(BaseModel):
-    latitude: float
-    longitude: float
-    month: int = 5
-    hour: int = 18
-    state_code: int = 40
-
 class IncidentReport(BaseModel):
     latitude: float
     longitude: float
@@ -331,18 +318,17 @@ class RiskResponse(BaseModel):
 def root():
     return {
         "name": "TerraAlert ML API",
-        "version": "6.0.0",
+        "version": "5.0.0",
         "status": "running",
         "models_loaded": list(models.keys()),
         "shap_ready": shap_explainer is not None,
         "features": [
             "live_weather", "shap_explainability", "email_alerts",
             "resource_allocation", "incident_reporting",
-            "prediction_history", "multi_hazard", "tornado_prediction"
+            "prediction_history", "multi_hazard"
         ],
         "endpoints": [
-            "/predict/wildfire", "/predict/flood",
-            "/predict/earthquake", "/predict/tornado",
+            "/predict/wildfire", "/predict/flood", "/predict/earthquake",
             "/explain/wildfire", "/live/earthquakes", "/resources",
             "/report/incident", "/report/incidents",
             "/history/predictions", "/weather/{lat}/{lon}"
@@ -541,59 +527,7 @@ def predict_earthquake(req: EarthquakeRequest):
         risk_level=risk_level,
         risk_score=round(risk_score, 3),
         confidence=0.79,
-        model_used="Temporal Fusion Transformer — RMSE 0.1176 on USGS data",
-        top_factors=factors,
-        timestamp=datetime.utcnow().isoformat(),
-        location={"lat": req.latitude, "lon": req.longitude},
-        allocated_resources=allocated if allocated else None
-    )
-
-@app.post("/predict/tornado", response_model=RiskResponse)
-def predict_tornado(req: TornadoRequest):
-    if 'tornado' not in models:
-        raise HTTPException(status_code=503, detail="Tornado model not loaded")
-
-    features = np.array([[
-        req.latitude, req.longitude,
-        req.month, req.hour, req.state_code
-    ]])
-
-    proba = models['tornado'].predict_proba(features)[0]
-    predicted_class = int(models['tornado'].predict(features)[0])
-
-    risk_map = {0: 0.15, 1: 0.55, 2: 0.90}
-    risk_score = risk_map.get(predicted_class, 0.5)
-    severity_labels = {0: 'Weak (EF0)', 1: 'Moderate (EF1-2)', 2: 'Strong (EF3-5)'}
-    risk_level = classify_risk(risk_score)
-
-    month_names = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',
-                   7:'Jul',8:'Aug',9:'Sep',10:'Oct',11:'Nov',12:'Dec'}
-
-    factors = [
-        f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
-        f"Predicted severity: {severity_labels.get(predicted_class)}",
-        f"Month: {month_names.get(req.month, req.month)} (May is peak tornado season)",
-        f"Hour: {req.hour}:00 local time",
-        f"State code: {req.state_code}"
-    ]
-
-    allocated = []
-    if risk_level == "CRITICAL":
-        allocated = allocate_resources(req.latitude, req.longitude, "tornado")
-        send_critical_alert("tornado", risk_level,
-                           {"lat": req.latitude, "lon": req.longitude},
-                           factors, None, allocated)
-
-    log_prediction("tornado", risk_level,
-                   round(float(max(proba)), 3),
-                   {"lat": req.latitude, "lon": req.longitude})
-
-    return RiskResponse(
-        disaster_type="tornado",
-        risk_level=risk_level,
-        risk_score=round(risk_score, 3),
-        confidence=round(float(max(proba)), 3),
-        model_used="Random Forest — trained on 68K NOAA tornado records (1950-2023)",
+        model_used="Temporal Fusion Transformer — RMSE 0.1179 on USGS data",
         top_factors=factors,
         timestamp=datetime.utcnow().isoformat(),
         location={"lat": req.latitude, "lon": req.longitude},
@@ -604,6 +538,7 @@ def predict_tornado(req: TornadoRequest):
 def explain_wildfire(req: WildfireRequest):
     feature_names = ['Latitude', 'Longitude', 'Fire Year', 'Cause Code', 'Day of Year']
 
+    # Use pre-computed explainer for instant response
     if shap_explainer is not None:
         try:
             features = np.array([[
@@ -627,11 +562,12 @@ def explain_wildfire(req: WildfireRequest):
         except Exception as e:
             print(f"SHAP failed: {e}")
 
+    # Fallback to hardcoded global SHAP values from notebook analysis
     return {
         "top_factors": [
-            {"feature": "Longitude",   "importance": 0.4521, "value": round(req.longitude, 4)},
-            {"feature": "Latitude",    "importance": 0.3847, "value": round(req.latitude, 4)},
-            {"feature": "Day of Year", "importance": 0.2534, "value": req.discovery_doy}
+            {"feature": "Longitude",    "importance": 0.4521, "value": round(req.longitude, 4)},
+            {"feature": "Latitude",     "importance": 0.3847, "value": round(req.latitude, 4)},
+            {"feature": "Day of Year",  "importance": 0.2534, "value": req.discovery_doy}
         ],
         "explanation": "Top predictor: Location (pre-computed from training data)"
     }
@@ -659,11 +595,17 @@ def submit_incident(report: IncidentReport):
 
 @app.get("/report/incidents")
 def get_incidents():
-    return {"count": len(incident_reports), "incidents": incident_reports}
+    return {
+        "count": len(incident_reports),
+        "incidents": incident_reports
+    }
 
 @app.get("/history/predictions")
 def get_prediction_history():
-    return {"count": len(prediction_history), "predictions": list(reversed(prediction_history))}
+    return {
+        "count": len(prediction_history),
+        "predictions": list(reversed(prediction_history))
+    }
 
 @app.get("/live/earthquakes")
 def live_earthquakes(min_magnitude: float = 4.0, hours: int = 48):
@@ -712,9 +654,17 @@ def live_earthquakes(min_magnitude: float = 4.0, hours: int = 48):
 
 @app.get("/live/wildfires")
 def live_wildfires():
-    return {"source": "NASA FIRMS", "status": "active", "model": "Random Forest + Live Weather"}
+    return {
+        "source": "NASA FIRMS",
+        "status": "active",
+        "model": "Random Forest + Live Weather"
+    }
 
 @app.get("/weather/{lat}/{lon}")
 def get_weather(lat: float, lon: float):
     weather = get_weather_features(lat, lon)
-    return {"location": {"lat": lat, "lon": lon}, "weather": weather, "timestamp": datetime.utcnow().isoformat()}
+    return {
+        "location": {"lat": lat, "lon": lon},
+        "weather": weather,
+        "timestamp": datetime.utcnow().isoformat()
+    }
