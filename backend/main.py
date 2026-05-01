@@ -413,7 +413,7 @@ def predict_wildfire(req: WildfireRequest):
     risk_level = classify_risk(risk_score)
 
     factors = [
-        f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
+        f"Location: {req.latitude:.2f}{'N' if req.latitude >= 0 else 'S'}, {abs(req.longitude):.2f}{'E' if req.longitude >= 0 else 'W'}",
         f"Predicted fire size class: {predicted_label}",
         f"Day of year: {req.discovery_doy}",
         f"Cause code: {req.cause_code}",
@@ -464,7 +464,7 @@ def predict_flood(req: FloodRequest):
 
     severity_labels = {0: 'Low', 1: 'Medium', 2: 'High'}
     factors = [
-        f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
+        f"Location: {req.latitude:.2f}{'N' if req.latitude >= 0 else 'S'}, {abs(req.longitude):.2f}{'E' if req.longitude >= 0 else 'W'}",
         f"Predicted severity: {severity_labels.get(predicted_severity, 'Unknown')}",
         f"Flood type code: {req.event_type_code}",
         f"State code: {req.state_code}"
@@ -508,7 +508,7 @@ def predict_earthquake(req: EarthquakeRequest):
     factors = [
         f"Magnitude: {mag}",
         f"Depth: {req.depth_km}km",
-        f"Location: {req.latitude:.2f}N, {req.longitude:.2f}W",
+        f"Location: {req.latitude:.2f}{'N' if req.latitude >= 0 else 'S'}, {abs(req.longitude):.2f}{'E' if req.longitude >= 0 else 'W'}",
         "TFT attention over last 10 seismic events"
     ]
 
