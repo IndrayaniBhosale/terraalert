@@ -1,5 +1,4 @@
 # TerraAlert 
-## AI-Powered Multi-Hazard Disaster Intelligence Platform
 
 > Predicting wildfires, floods, earthquakes, and tornadoes using real government data and machine learning with live deployment, SHAP explainability, and automated emergency response.
 
